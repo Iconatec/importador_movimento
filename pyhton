@@ -1,0 +1,1734 @@
+from __future__ import annotations
+
+import ctypes
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+
+import pdfplumber
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+# --------------------------------------------------------------------------
+# CONFIGURAÇÕES E COLUNAS DA PLANILHA
+# --------------------------------------------------------------------------
+MOVIMENTACAO_COLUNAS = ["Arquivo", "Banco", "Conta", "Data", "Descrição", "Valor", "Saldo"]
+MOVIMENTACAO_COLUNAS_ERROS = ["Arquivo", "Banco", "Motivo"]
+MOVIMENTACAO_COR_CABECALHO = "31869B"  # RGB: 49, 134, 155
+MOVIMENTACAO_NOME_ARQUIVO = "extratos_movimentacao.xlsx"
+MOVIMENTACAO_MOEDA = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}")
+MOVIMENTACAO_DATA = re.compile(r"\d{2}/\d{2}/\d{4}")
+
+# --------------------------------------------------------------------------
+# FUNÇÕES AUXILIARES
+# --------------------------------------------------------------------------
+def movimentacao_numero_br(texto: str) -> Decimal:
+    texto = texto.strip().replace("−", "-").replace(" ", "")
+    if not MOVIMENTACAO_MOEDA.fullmatch(texto):
+        raise ValueError(f"Valor monetário inválido: {texto!r}")
+    return Decimal(texto.replace(".", "").replace(",", "."))
+
+
+def movimentacao_agrupar_linhas(palavras):
+    linhas = []
+    for palavra in sorted(palavras, key=lambda p: (p["top"], p["x0"])):
+        if not linhas or abs(palavra["top"] - linhas[-1][0]["top"]) > 3:
+            linhas.append([palavra])
+        else:
+            linhas[-1].append(palavra)
+    return [sorted(linha, key=lambda p: p["x0"]) for linha in linhas]
+
+
+def movimentacao_texto_linha(linha):
+    return " ".join(p["text"] for p in linha)
+
+
+def movimentacao_criar_registro(arquivo, banco, conta, data, descricao, valor, saldo):
+    return {
+        "Arquivo": arquivo,
+        "Banco": banco,
+        "Conta": conta,
+        "Data": data,
+        "Descrição": descricao,
+        "Valor": valor,
+        "Saldo": saldo,
+    }
+
+
+def movimentacao_extrair_paginas(caminho_pdf: Path):
+    paginas = []
+    with pdfplumber.open(caminho_pdf) as documento:
+        for pagina in documento.pages:
+            paginas.append(movimentacao_agrupar_linhas(pagina.extract_words()))
+    if not any(paginas):
+        raise ValueError("PDF sem texto extraível. OCR não está integrado a esta versão.")
+    return paginas
+
+
+def movimentacao_identificar_sicredi(texto: str) -> bool:
+    return bool(re.search(r"Sicredi", texto, re.I))
+
+
+def movimentacao_extrair_conta_sicredi(texto: str) -> str:
+    encontrado = re.search(r"\bConta:\s*([\d.]+-\d+)\b", texto, re.I)
+    if not encontrado:
+        raise ValueError("Conta do Sicredi não encontrada.")
+    return encontrado.group(1)
+
+
+def movimentacao_extrair_registros_sicredi(paginas, arquivo: str):
+    texto = "\n".join(movimentacao_texto_linha(l) for p in paginas for l in p)
+    conta = movimentacao_extrair_conta_sicredi(texto)
+    periodo = re.search(
+        r"Período\s+de\s+(\d{2}/\d{2}/\d{4})\s+a\s+(\d{2}/\d{2}/\d{4})",
+        texto, re.I,
+    )
+    if not periodo:
+        raise ValueError("Período do extrato Sicredi não encontrado.")
+    inicio, fim = [datetime.strptime(d, "%d/%m/%Y") for d in periodo.groups()]
+    registros = []
+    limites = None
+    parar = False
+    for numero_pagina, linhas in enumerate(paginas, 1):
+        for linha in linhas:
+            texto_linha = movimentacao_texto_linha(linha)
+            if re.search(r"Lançamentos\s+Futuros", texto_linha, re.I):
+                parar = True
+                break
+            rotulos = {p["text"].casefold(): p for p in linha}
+            if all(r in rotulos for r in ("data", "descrição", "documento", "valor", "saldo")):
+                limites = (rotulos["descrição"]["x0"] - 2, rotulos["documento"]["x0"] - 2)
+                continue
+            if limites is None:
+                continue
+            if re.search(r"\bSALDO\s+ANTERIOR\b", texto_linha, re.I):
+                if registros:
+                    raise ValueError("Saldo anterior repetido ou localizado após movimentações; conferir modelo.")
+                valores = MOVIMENTACAO_MOEDA.findall(texto_linha)
+                if len(valores) != 1:
+                    raise ValueError("Não foi possível identificar o saldo anterior com segurança.")
+                registros.append(movimentacao_criar_registro(
+                    arquivo, "Sicredi", conta, None, "SALDO ANTERIOR", None,
+                    movimentacao_numero_br(valores[0]),
+                ))
+                continue
+            primeira = linha[0]["text"]
+            if MOVIMENTACAO_DATA.fullmatch(primeira):
+                if not registros:
+                    raise ValueError("Saldo anterior não encontrado antes das movimentações.")
+                data = datetime.strptime(primeira, "%d/%m/%Y")
+                if not inicio <= data <= fim:
+                    raise ValueError(f"Movimentação fora do período: {primeira}.")
+                valores = [p for p in linha if p["x0"] >= limites[1] and MOVIMENTACAO_MOEDA.fullmatch(p["text"])]
+                if len(valores) != 2:
+                    raise ValueError(f"Página {numero_pagina}: valor/saldo não identificados: {texto_linha}")
+                descricao = " ".join(p["text"] for p in linha if limites[0] <= p["x0"] < limites[1])
+                if not descricao:
+                    raise ValueError(f"Descrição vazia em {primeira}.")
+                valor, saldo = [movimentacao_numero_br(p["text"]) for p in valores]
+                esperado = registros[-1]["Saldo"] + valor
+                if esperado != saldo:
+                    raise ValueError(f"Saldo divergente em {primeira}: anterior + valor = {esperado}; PDF = {saldo}.")
+                registros.append(movimentacao_criar_registro(
+                    arquivo, "Sicredi", conta, data, descricao, valor, saldo,
+                ))
+                continue
+            if registros and registros[-1]["Descrição"] != "SALDO ANTERIOR" and all(limites[0] <= p["x0"] < limites[1] for p in linha):
+                registros[-1]["Descrição"] += " " + texto_linha
+        if parar:
+            break
+    if not registros:
+        raise ValueError("Saldo anterior não encontrado ou tabela de movimentações não reconhecida.")
+    return registros
+
+
+def movimentacao_processar_extrato_sicredi(caminho_pdf: Path, paginas=None):
+    if paginas is None:
+        paginas = movimentacao_extrair_paginas(caminho_pdf)
+    return movimentacao_extrair_registros_sicredi(paginas, caminho_pdf.stem)
+
+
+def movimentacao_identificar_caixa(texto: str) -> bool:
+    return bool(
+        re.search(
+            r"Extrato\s+por\s+per[ií]odo",
+            texto,
+            re.I,
+        )
+        and re.search(
+            r"\bConta:\s*\d+\s*\|\s*\d+\s*\|\s*[\d.-]+",
+            texto,
+            re.I,
+        )
+    )
+
+
+def movimentacao_numero_caixa(
+    valor: str,
+    indicador: str = "",
+) -> Decimal:
+    numero = movimentacao_numero_br(valor)
+
+    indicador = indicador.strip().upper()
+
+    if indicador == "D":
+        return -abs(numero)
+
+    if indicador == "C":
+        return abs(numero)
+
+    return numero
+
+def movimentacao_extrair_conta_caixa(texto: str) -> str:
+    encontrado = re.search(
+        r"\bConta:\s*"
+        r"\d+\s*\|\s*"
+        r"\d+\s*\|\s*"
+        r"(\d+)\s*-\s*(\d+)",
+        texto,
+        re.I,
+    )
+
+    if not encontrado:
+        raise ValueError(
+            "Conta da Caixa não encontrada no formato "
+            "'agência | operação | conta-dígito'."
+        )
+
+    numero = encontrado.group(1).lstrip("0") or "0"
+    digito = encontrado.group(2)
+
+    return f"{numero}-{digito}"
+
+def movimentacao_extrair_registros_caixa(
+    paginas,
+    arquivo: str,
+):
+    # Limpa cada linha antes de juntar o texto das páginas.
+    linhas_limpas = []
+
+    for pagina in paginas:
+        for linha in pagina:
+            texto_linha = movimentacao_texto_linha(linha).strip()
+
+            if not texto_linha:
+                continue
+
+            # O endereço contém datas que não são lançamentos.
+            if re.search(
+                r"https?://|gerenciador\.caixa\.gov\.br|hdnDataInicio=|hdnDataFinal=",
+                texto_linha,
+                re.I,
+            ):
+                continue
+
+            # Cabeçalho de impressão repetido nas páginas.
+            if re.match(
+                r"^\d{2}/\d{2}/\d{4},?\s+\d{2}:\d{2}",
+                texto_linha,
+            ):
+                continue
+
+            if re.fullmatch(r"\d+\s*/\s*\d+", texto_linha):
+                continue
+
+            linhas_limpas.append(texto_linha)
+
+    texto = re.sub(r"\s+", " ", " ".join(linhas_limpas)).strip()
+
+    conta = movimentacao_extrair_conta_caixa(texto)
+
+    padrao_numero = r"(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}"
+
+    # O saldo anterior possui dois valores:
+    # valor do lançamento e saldo da conta.
+    saldo_anterior_match = re.search(
+        rf"\bSALDO\s+ANTERIOR\s+"
+        rf"(?P<valor>{padrao_numero})"
+        rf"(?:\s*(?P<tipo_valor>[CD])\b)?\s+"
+        rf"(?P<saldo>{padrao_numero})"
+        rf"\s*(?P<tipo_saldo>[CD])\b",
+        texto,
+        re.I,
+    )
+
+    if not saldo_anterior_match:
+        raise ValueError(
+            "Saldo anterior da Caixa não encontrado."
+        )
+
+    saldo_anterior = movimentacao_numero_caixa(
+        saldo_anterior_match.group("saldo"),
+        saldo_anterior_match.group("tipo_saldo"),
+    )
+
+    registros = [
+        movimentacao_criar_registro(
+            arquivo,
+            "Caixa",
+            conta,
+            None,
+            "SALDO ANTERIOR",
+            None,
+            saldo_anterior,
+        )
+    ]
+
+    corpo = texto[saldo_anterior_match.end():]
+
+    # Remove o rodapé antes de interpretar os lançamentos.
+    corpo = re.split(
+        r"\*\s*661\b"
+        r"|\bSAC\s+CAIXA\b"
+        r"|\bOuvidoria\b"
+        r"|\bAl[oô]\s+CAIXA\b",
+        corpo,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+
+    padrao_data = re.compile(
+        r"\b\d{2}/\d{2}/\d{4}\b"
+    )
+
+    datas = list(padrao_data.finditer(corpo))
+
+    padrao_lancamento = re.compile(
+        rf"^(?P<data>\d{{2}}/\d{{2}}/\d{{4}})\s+"
+        rf"(?P<documento>\d+)\s+"
+        rf"(?P<descricao>.+?)\s+"
+        rf"(?P<valor>{padrao_numero})"
+        rf"\s*(?P<tipo_valor>[CD])\s+"
+        rf"(?P<saldo>{padrao_numero})"
+        rf"\s*(?P<tipo_saldo>[CD])\b",
+        re.I,
+    )
+
+    saldo_referencia = saldo_anterior
+
+    for indice, marcador in enumerate(datas):
+        inicio = marcador.start()
+
+        if indice + 1 < len(datas):
+            fim = datas[indice + 1].start()
+        else:
+            fim = len(corpo)
+
+        trecho = corpo[inicio:fim].strip()
+
+        encontrado = padrao_lancamento.match(trecho)
+
+        if not encontrado:
+            raise ValueError(
+                "Lançamento da Caixa não reconhecido: "
+                f"{trecho[:200]}"
+            )
+
+        data_texto = encontrado.group("data")
+        data = datetime.strptime(
+            data_texto,
+            "%d/%m/%Y",
+        )
+
+        descricao = re.sub(
+            r"\s+",
+            " ",
+            encontrado.group("descricao"),
+        ).strip()
+
+        valor = movimentacao_numero_caixa(
+            encontrado.group("valor"),
+            encontrado.group("tipo_valor"),
+        )
+
+        saldo = movimentacao_numero_caixa(
+            encontrado.group("saldo"),
+            encontrado.group("tipo_saldo"),
+        )
+
+        # SALDO DIA é apenas uma linha de conferência.
+        if re.fullmatch(
+            r"SALDO\s+DIA",
+            descricao,
+            re.I,
+        ):
+            if saldo != saldo_referencia:
+                raise ValueError(
+                    f"Saldo dia divergente em {data_texto}: "
+                    f"último saldo = {saldo_referencia}; "
+                    f"saldo dia = {saldo}."
+                )
+
+            continue
+
+        esperado = saldo_referencia + valor
+
+        if esperado != saldo:
+            raise ValueError(
+                f"Saldo divergente em {data_texto}: "
+                f"anterior + valor = {esperado}; "
+                f"PDF = {saldo}."
+            )
+
+        registros.append(
+            movimentacao_criar_registro(
+                arquivo,
+                "Caixa",
+                conta,
+                data,
+                descricao,
+                valor,
+                saldo,
+            )
+        )
+
+        saldo_referencia = saldo
+
+    # Evita aceitar silenciosamente um conteúdo que não foi interpretado.
+    if not datas and corpo.strip():
+        raise ValueError(
+            "Há conteúdo após o saldo anterior, mas nenhuma "
+            "movimentação da Caixa foi reconhecida."
+        )
+
+    return registros
+
+
+
+def movimentacao_processar_extrato_caixa(
+    caminho_pdf: Path,
+    paginas=None,
+):
+    if paginas is None:
+        paginas = movimentacao_extrair_paginas(
+            caminho_pdf
+        )
+
+    return movimentacao_extrair_registros_caixa(
+        paginas,
+        caminho_pdf.stem,
+    )
+
+# --------------------------------------------------------------------------
+# BB — IDENTIFICAÇÃO DO MODELO
+# --------------------------------------------------------------------------
+def movimentacao_identificar_bb(texto: str) -> bool:
+    return bool(
+        re.search(
+            r"Cliente\s*-\s*Conta\s+atual",
+            texto,
+            re.I,
+        )
+        and re.search(
+            r"Conta\s+corrente\s+\d[\d.]*-\d+",
+            texto,
+            re.I,
+        )
+        and re.search(
+            r"Lançamentos",
+            texto,
+            re.I,
+        )
+    )
+
+
+# --------------------------------------------------------------------------
+# BB — CONVERSÃO DOS VALORES COM INDICADORES C/D
+# --------------------------------------------------------------------------
+def movimentacao_numero_bb(
+    valor: str,
+    indicador: str,
+) -> Decimal:
+    numero = movimentacao_numero_br(valor)
+    indicador = indicador.strip().upper()
+
+    if indicador == "D":
+        return -abs(numero)
+
+    if indicador == "C":
+        return abs(numero)
+
+    raise ValueError(
+        f"Indicador de valor do BB inválido: {indicador!r}"
+    )
+
+
+# --------------------------------------------------------------------------
+# BB — EXTRAÇÃO DA CONTA
+# --------------------------------------------------------------------------
+def movimentacao_extrair_conta_bb(texto: str) -> str:
+    encontrado = re.search(
+        r"\bConta\s+corrente\s+"
+        r"(\d[\d.]*-\d+)\b",
+        texto,
+        re.I,
+    )
+
+    if not encontrado:
+        raise ValueError(
+            "Número da conta corrente do BB não encontrado."
+        )
+
+    return encontrado.group(1).replace(".", "")
+
+
+# --------------------------------------------------------------------------
+# BB — LIMPEZA DE CABEÇALHOS E RODAPÉS
+# --------------------------------------------------------------------------
+def movimentacao_limpar_texto_bb(paginas) -> str:
+    linhas_limpas = []
+
+    for pagina in paginas:
+        for linha in pagina:
+            texto_linha = movimentacao_texto_linha(
+                linha
+            ).strip()
+
+            if not texto_linha:
+                continue
+
+            # Data e horário da impressão do navegador.
+            if re.fullmatch(
+                r"\d{2}/\d{2}/\d{4},?\s+"
+                r"\d{2}:\d{2}(?::\d{2})?",
+                texto_linha,
+            ):
+                continue
+
+            # Nome do banco no rodapé do navegador.
+            if re.fullmatch(
+                r"Banco\s+do\s+Brasil",
+                texto_linha,
+                re.I,
+            ):
+                continue
+
+            # Endereço do site impresso no rodapé.
+            if re.search(
+                r"https?://|autoatendimento\.bb\.com\.br",
+                texto_linha,
+                re.I,
+            ):
+                continue
+
+            # Numeração das páginas: 1/4, 2/4 etc.
+            if re.fullmatch(
+                r"\d+\s*/\s*\d+",
+                texto_linha,
+            ):
+                continue
+
+            linhas_limpas.append(texto_linha)
+
+    texto = " ".join(linhas_limpas)
+
+    texto = re.sub(
+        r"\s+",
+        " ",
+        texto,
+    ).strip()
+
+    # Remove as observações e mensagens posteriores ao extrato.
+    texto = re.split(
+        r"\*{3}"
+        r"|\bOBSERVAÇÕES\s*:"
+        r"|\bTransação\s+efetuada\s+com\s+sucesso",
+        texto,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+
+    return texto.strip()
+
+
+# --------------------------------------------------------------------------
+# BB — SALDO ANTERIOR E MOVIMENTAÇÕES
+# --------------------------------------------------------------------------
+def movimentacao_extrair_registros_bb(
+    paginas,
+    arquivo: str,
+):
+    texto = movimentacao_limpar_texto_bb(
+        paginas
+    )
+
+    conta = movimentacao_extrair_conta_bb(
+        texto
+    )
+
+    padrao_numero = (
+        r"(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}"
+    )
+
+    # Um lançamento começa por:
+    # data, data de movimento opcional, agência, lote e histórico.
+    #
+    # As datas existentes dentro dos complementos não possuem
+    # essa sequência e não iniciam um novo lançamento.
+    padrao_inicio = re.compile(
+        r"(?<!\S)"
+        r"(?P<data>\d{2}/\d{2}/\d{4})\s+"
+        r"(?:(?P<data_movimento>"
+        r"\d{2}/\d{2}/\d{4})\s+)?"
+        r"(?P<agencia>\d{4})\s+"
+        r"(?P<lote>\d{5})\s+"
+        r"(?P<codigo>\d{3})\s+",
+        re.I,
+    )
+
+    inicios = list(
+        padrao_inicio.finditer(texto)
+    )
+
+    if not inicios:
+        raise ValueError(
+            "Nenhum lançamento do BB foi reconhecido."
+        )
+
+    padrao_saldo = re.compile(
+        rf"^(?P<saldo>{padrao_numero})"
+        rf"\s*(?P<tipo>[CD])\b",
+        re.I,
+    )
+
+    padrao_movimentacao = re.compile(
+        rf"^(?P<descricao>.+?)\s+"
+        rf"(?P<documento>\d[\d.]*)\s+"
+        rf"(?P<valor>{padrao_numero})"
+        rf"\s*(?P<tipo_valor>[CD])\b"
+        rf"(?:\s+"
+        rf"(?P<saldo>{padrao_numero})"
+        rf"\s*(?P<tipo_saldo>[CD])\b"
+        rf")?"
+        rf"(?P<complemento>.*)$",
+        re.I,
+    )
+
+    registros = []
+    saldo_calculado = None
+    encontrou_saldo_final = False
+
+    for indice, inicio in enumerate(inicios):
+        fim = (
+            inicios[indice + 1].start()
+            if indice + 1 < len(inicios)
+            else len(texto)
+        )
+
+        conteudo = texto[
+            inicio.end():fim
+        ].strip()
+
+        data_texto = inicio.group("data")
+
+        data = datetime.strptime(
+            data_texto,
+            "%d/%m/%Y",
+        )
+
+        codigo = inicio.group("codigo")
+
+        # --------------------------------------------------------------
+        # SALDO ANTERIOR
+        # --------------------------------------------------------------
+        anterior = re.match(
+            r"^Saldo\s+Anterior\s+",
+            conteudo,
+            re.I,
+        )
+
+        if anterior:
+            if registros:
+                raise ValueError(
+                    "Saldo anterior do BB repetido ou localizado "
+                    "depois das movimentações."
+                )
+
+            saldo_match = padrao_saldo.match(
+                conteudo[anterior.end():].strip()
+            )
+
+            if not saldo_match:
+                raise ValueError(
+                    "Valor do saldo anterior do BB não reconhecido."
+                )
+
+            saldo_calculado = movimentacao_numero_bb(
+                saldo_match.group("saldo"),
+                saldo_match.group("tipo"),
+            )
+
+            registros.append(
+                movimentacao_criar_registro(
+                    arquivo,
+                    "BB",
+                    conta,
+                    data,
+                    "SALDO ANTERIOR",
+                    None,
+                    saldo_calculado,
+                )
+            )
+
+            continue
+
+        if saldo_calculado is None:
+            raise ValueError(
+                "Saldo anterior do BB não encontrado "
+                "antes das movimentações."
+            )
+
+        # --------------------------------------------------------------
+        # SALDO FINAL — NÃO É UMA MOVIMENTAÇÃO
+        # --------------------------------------------------------------
+        final = re.match(
+            r"^S\s*A\s*L\s*D\s*O\b\s*",
+            conteudo,
+            re.I,
+        )
+
+        if codigo == "999" and final:
+            saldo_match = padrao_saldo.match(
+                conteudo[final.end():].strip()
+            )
+
+            if not saldo_match:
+                raise ValueError(
+                    "Saldo final do BB não reconhecido."
+                )
+
+            saldo_final = movimentacao_numero_bb(
+                saldo_match.group("saldo"),
+                saldo_match.group("tipo"),
+            )
+
+            if saldo_calculado != saldo_final:
+                raise ValueError(
+                    f"Saldo final divergente no BB: "
+                    f"calculado = {saldo_calculado}; "
+                    f"PDF = {saldo_final}."
+                )
+
+            if encontrou_saldo_final:
+                raise ValueError(
+                    "Linha de saldo final do BB repetida."
+                )
+
+            registros.append(
+                movimentacao_criar_registro(
+                    arquivo,
+                    "BB",
+                    conta,
+                    data,
+                    "SALDO FINAL",
+                    None,
+                    saldo_final,
+                )
+            )
+
+            encontrou_saldo_final = True
+            continue
+
+        if encontrou_saldo_final:
+            raise ValueError(
+                "Foram encontrados lançamentos depois "
+                "da linha de saldo final do BB."
+            )
+
+        # --------------------------------------------------------------
+        # MOVIMENTAÇÃO NORMAL
+        # --------------------------------------------------------------
+        encontrado = padrao_movimentacao.fullmatch(
+            conteudo
+        )
+
+        if not encontrado:
+            raise ValueError(
+                f"Lançamento do BB não reconhecido "
+                f"em {data_texto}: {conteudo[:220]}"
+            )
+
+        descricao = encontrado.group(
+            "descricao"
+        ).strip()
+
+        complemento = encontrado.group(
+            "complemento"
+        ).strip()
+
+        if complemento:
+            descricao = (
+                f"{descricao} {complemento}"
+            )
+
+        descricao = re.sub(
+            r"\s+",
+            " ",
+            descricao,
+        ).strip()
+
+        valor = movimentacao_numero_bb(
+            encontrado.group("valor"),
+            encontrado.group("tipo_valor"),
+        )
+
+        saldo_calculado += valor
+
+        saldo_informado = None
+
+        if encontrado.group("saldo") is not None:
+            saldo_informado = movimentacao_numero_bb(
+                encontrado.group("saldo"),
+                encontrado.group("tipo_saldo"),
+            )
+
+            if saldo_calculado != saldo_informado:
+                raise ValueError(
+                    f"Saldo divergente no BB "
+                    f"em {data_texto}: "
+                    f"calculado = {saldo_calculado}; "
+                    f"PDF = {saldo_informado}."
+                )
+
+        registros.append(
+            movimentacao_criar_registro(
+                arquivo,
+                "BB",
+                conta,
+                data,
+                descricao,
+                valor,
+                saldo_informado,
+            )
+        )
+
+    if not registros:
+        raise ValueError(
+            "Nenhum registro do BB foi extraído."
+        )
+
+    return registros
+
+
+# --------------------------------------------------------------------------
+# BB — PROCESSADOR DO ARQUIVO
+# --------------------------------------------------------------------------
+def movimentacao_processar_extrato_bb(
+    caminho_pdf: Path,
+    paginas=None,
+):
+    if paginas is None:
+        paginas = movimentacao_extrair_paginas(
+            caminho_pdf
+        )
+
+    return movimentacao_extrair_registros_bb(
+        paginas,
+        caminho_pdf.stem,
+    )
+
+# --------------------------------------------------------------------------
+# ITAÚ — IDENTIFICAÇÃO DO MODELO
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# ITAÚ — IDENTIFICAÇÃO E FUNÇÕES AUXILIARES
+# --------------------------------------------------------------------------
+def movimentacao_identificar_itau(texto: str) -> bool:
+    texto = re.sub(r"\s+", " ", texto)
+    return bool(re.search(r"\bConta\s+\d+\s*-\s*\d+", texto, re.I)
+                and re.search(r"Lançamentos\s+do\s+período\s*:", texto, re.I))
+
+
+def movimentacao_extrair_conta_itau(texto: str) -> str:
+    m = re.search(r"\bConta\s+(\d+)\s*-\s*(\d+)\b", texto, re.I)
+    if not m:
+        raise ValueError("Conta do Itaú não localizada.")
+    return f"{m.group(1)}-{m.group(2)}"
+
+
+def movimentacao_tipo_registro_itau(descricao: str) -> str:
+    texto = re.sub(r"\s+", " ", descricao).strip().upper()
+    if texto == "SALDO ANTERIOR":
+        return "ANTERIOR"
+    if texto == "SALDO TOTAL DISPONÍVEL DIA":
+        return "TOTAL"
+    if texto == "SALDO MOVIMENTAÇÃO CONTA":
+        return "CONTA"
+    if re.fullmatch(r"SALDO APLIC\. AUT\.|SDO APLIC AUT MAIS AP", texto):
+        return "APLICACAO"
+    if texto.startswith(("SALDO ", "SDO ")):
+        raise ValueError(f"Tipo de saldo do Itaú ainda não mapeado: {descricao}.")
+    return "MOVIMENTACAO"
+
+
+def movimentacao_unicos_itau(valores, tolerancia=1):
+    saida = []
+    for valor in sorted(valores):
+        if not saida or valor - saida[-1] > tolerancia:
+            saida.append(valor)
+    return saida
+
+
+def movimentacao_celulas_itau(palavras, limites, topo, base):
+    celulas = []
+    for esquerda, direita in zip(limites, limites[1:]):
+        selecionadas = [p for p in palavras
+            if esquerda <= (p["x0"] + p["x1"]) / 2 < direita
+            and topo < (p["top"] + p["bottom"]) / 2 < base]
+        linhas = movimentacao_agrupar_linhas(selecionadas)
+        celulas.append(" ".join(movimentacao_texto_linha(l) for l in linhas).strip())
+    return celulas
+
+
+# --------------------------------------------------------------------------
+# ITAÚ — LEITURA DA TABELA, INCLUSIVE SEM CABEÇALHO REPETIDO
+# --------------------------------------------------------------------------
+def movimentacao_ler_pagina_itau(pagina, configuracao=None):
+    palavras = pagina.extract_words()
+    linhas = movimentacao_agrupar_linhas(palavras)
+    cabecalho = None
+    for linha in linhas:
+        rotulos = {p["text"].casefold() for p in linha}
+        if {"data", "lançamentos", "cnpj/cpf", "valor", "saldo"} <= rotulos:
+            cabecalho = linha
+            break
+    inicio = max(p["bottom"] for p in cabecalho) if cabecalho else 0
+    corte = pagina.height
+    for linha in linhas:
+        topo = min(p["top"] for p in linha)
+        if topo < inicio:
+            continue
+        if re.search(
+            r"Saldo\s+da\s+conta\s+corrente|Lançamentos\s+futuros"
+            r"|Os\s+saldos\s+acima|atualizado\s+em|Em\s+caso\s+de\s+d[uú]vidas",
+            movimentacao_texto_linha(linha), re.I):
+            corte = min(corte, topo)
+    horizontais = [e for e in pagina.edges
+        if e["orientation"] == "h" and inicio <= e["top"] < corte]
+    if not horizontais:
+        if corte < pagina.height:
+            return [], configuracao, True
+        raise ValueError(f"Tabela do Itaú não localizada na página {pagina.page_number}.")
+    limites = None
+    for y in movimentacao_unicos_itau([e["top"] for e in horizontais]):
+        bordas = [e for e in horizontais if abs(e["top"] - y) < 0.3]
+        xs = movimentacao_unicos_itau([e[k] for e in bordas for k in ("x0", "x1")])
+        if len(xs) == 7:
+            limites = xs
+            break
+    if limites is None:
+        if configuracao is None:
+            raise ValueError("As seis colunas do Itaú não foram reconhecidas.")
+        limites = list(configuracao)
+    x_data = (limites[0] + limites[1]) / 2
+    separadores = movimentacao_unicos_itau([
+        e["top"] for e in horizontais if e["x0"] <= x_data <= e["x1"]])
+    celulas = []
+    for topo, base in zip(separadores, separadores[1:]):
+        linha = movimentacao_celulas_itau(palavras, limites, topo, base)
+        if any(linha):
+            celulas.append(linha)
+    datas = [p for p in palavras
+        if limites[0] <= (p["x0"] + p["x1"]) / 2 < limites[1]
+        and inicio < p["top"] < corte
+        and re.fullmatch(r"\d{2}/\d{2}/\d{4}", p["text"])]
+    if len(datas) != sum(bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}", l[0])) for l in celulas):
+        raise ValueError(f"Há linhas datadas sem divisórias completas na página {pagina.page_number}.")
+    return celulas, limites, corte < pagina.height
+
+
+# --------------------------------------------------------------------------
+# ITAÚ — RECONSTRUÇÃO DAS CÉLULAS QUEBRADAS ENTRE PÁGINAS
+# --------------------------------------------------------------------------
+def movimentacao_juntar_linhas_itau(linhas):
+    saida = []
+    pendente = None
+    for linha in linhas:
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", linha[0]):
+            if pendente:
+                for i in range(1, 6):
+                    linha[i] = " ".join(t for t in (pendente[i], linha[i]) if t)
+                pendente = None
+            saida.append(linha)
+        elif not linha[0] and any(linha[1:]):
+            # Fragmento sem data/valor no fim de uma página: guarda
+            # para a linha datada que continua na página seguinte.
+            if linha[4] or linha[5]:
+                raise ValueError(f"Linha monetária do Itaú sem data: {linha}")
+            if pendente is None:
+                pendente = linha
+            else:
+                pendente = [" ".join(t for t in (a, b) if t) for a, b in zip(pendente, linha)]
+        else:
+            raise ValueError(f"Linha de tabela do Itaú não reconhecida: {linha}")
+    if pendente:
+        raise ValueError(f"Fragmento do Itaú sem continuação: {pendente}")
+    return saida
+
+
+# --------------------------------------------------------------------------
+# ITAÚ — ORGANIZAÇÃO E EXPORTAÇÃO DE TODOS OS TIPOS DE SALDO
+# --------------------------------------------------------------------------
+def movimentacao_organizar_itau(linhas, arquivo, conta, inicio, fim):
+    lidos = []
+    for data_txt, historico, razao, documento, valor_txt, saldo_txt in linhas:
+        data = datetime.strptime(data_txt, "%d/%m/%Y")
+        tipo = movimentacao_tipo_registro_itau(historico)
+        if tipo == "MOVIMENTACAO":
+            if not historico or not valor_txt or saldo_txt:
+                raise ValueError(f"Colunas de movimentação inválidas em {data_txt}: {historico}.")
+            descricao = " ".join(t for t in (historico, razao, documento) if t)
+            valor = movimentacao_numero_br(valor_txt.replace("−", "-"))
+            saldo = None
+        else:
+            if not saldo_txt or valor_txt:
+                raise ValueError(f"Colunas de saldo inválidas em {data_txt}: {historico}.")
+            descricao, valor = historico, None
+            saldo = movimentacao_numero_br(saldo_txt.replace("−", "-"))
+        lidos.append((data, tipo, descricao, valor, saldo))
+    anteriores = [r for r in lidos if r[1] == "ANTERIOR"]
+    if len(anteriores) != 1:
+        raise ValueError("É necessário exatamente um saldo anterior no Itaú.")
+    anterior = anteriores[0]
+    if anterior[0] > inicio:
+        raise ValueError("Saldo anterior do Itaú posterior ao início do período.")
+    saida = [movimentacao_criar_registro(arquivo, "Itaú", conta, anterior[0], anterior[2], None, anterior[4])]
+    dias = {}
+    for r in lidos:
+        if r[1] == "ANTERIOR":
+            continue
+        if not inicio <= r[0] <= fim:
+            raise ValueError(f"Data fora do período do Itaú: {r[0]:%d/%m/%Y}.")
+        dias.setdefault(r[0], []).append(r)
+    possui_aplicacao = any(r[1] == "APLICACAO" for r in lidos)
+    acumulado = anterior[4]
+    for data, grupo in sorted(dias.items()):
+        movimentos = [r for r in grupo if r[1] == "MOVIMENTACAO"]
+        saldos = [r for r in grupo if r[1] != "MOVIMENTACAO"]
+        for r in movimentos:
+            acumulado += r[3]
+            saida.append(movimentacao_criar_registro(arquivo, "Itaú", conta, data, r[2], r[3], None))
+        # Não mistura saldo consolidado com conta e aplicação.
+        # Sem saldo de aplicação, mantém a conferência simples dos modelos anteriores.
+        if not possui_aplicacao:
+            for r in saldos:
+                if r[4] != acumulado:
+                    raise ValueError(f"Saldo divergente no Itaú em {data:%d/%m/%Y}: calculado = {acumulado}; PDF = {r[4]}.")
+        categorias = {}
+        for r in saldos:
+            if r[1] in categorias and categorias[r[1]] != r[4]:
+                raise ValueError(f"Saldos conflitantes do mesmo tipo em {data:%d/%m/%Y}.")
+            categorias[r[1]] = r[4]
+        if {"TOTAL", "CONTA", "APLICACAO"} <= categorias.keys():
+            if categorias["TOTAL"] != categorias["CONTA"] + categorias["APLICACAO"]:
+                raise ValueError(f"Total diferente de conta + aplicação no Itaú em {data:%d/%m/%Y}.")
+        for r in saldos:
+            saida.append(movimentacao_criar_registro(arquivo, "Itaú", conta, data, r[2], None, r[4]))
+    return saida
+
+
+# --------------------------------------------------------------------------
+# ITAÚ — PROCESSADOR DO PDF
+# --------------------------------------------------------------------------
+def movimentacao_processar_extrato_itau(caminho_pdf: Path, paginas=None):
+    with pdfplumber.open(caminho_pdf) as pdf:
+        if not pdf.pages:
+            raise ValueError("PDF do Itaú sem páginas.")
+        texto = re.sub(r"\s+", " ", pdf.pages[0].extract_text() or "")
+        conta = movimentacao_extrair_conta_itau(texto)
+        periodo = re.search(
+            r"Lançamentos\s+do\s+período\s*:\s*(\d{2}/\d{2}/\d{4})"
+            r"\s+at[eé]\s+(\d{2}/\d{2}/\d{4})", texto, re.I)
+        if not periodo:
+            raise ValueError("Período do Itaú não localizado.")
+        inicio, fim = [datetime.strptime(t, "%d/%m/%Y") for t in periodo.groups()]
+        if inicio > fim:
+            raise ValueError("Período inválido no Itaú.")
+        linhas, configuracao = [], None
+        for pagina in pdf.pages:
+            novas, configuracao, encerrou = movimentacao_ler_pagina_itau(pagina, configuracao)
+            linhas.extend(novas)
+            if encerrou:
+                break
+    linhas = movimentacao_juntar_linhas_itau(linhas)
+    return movimentacao_organizar_itau(linhas, caminho_pdf.stem, conta, inicio, fim)
+
+# --------------------------------------------------------------------------
+# BRADESCO — IDENTIFICAÇÃO DO MODELO
+# --------------------------------------------------------------------------
+def movimentacao_identificar_bradesco(texto: str) -> bool:
+    texto = re.sub(r"\s+", " ", texto)
+    return bool(
+        re.search(r"Extrato\s+de\s*:", texto, re.I)
+        and re.search(r"\bDcto\.?", texto, re.I)
+        and re.search(r"Cr[eé]dito\s*\(R\$\)", texto, re.I)
+        and re.search(r"D[eé]bito\s*\(R\$\)", texto, re.I)
+        and re.search(r"\b\d{4,5}\s*\|\s*\d{5,}-\d+", texto)
+    )
+
+
+def movimentacao_extrair_conta_bradesco(texto: str) -> str:
+    m = re.search(r"\b\d{4,5}\s*\|\s*(\d{5,})\s*-\s*(\d+)\b", texto)
+    if not m:
+        m = re.search(r"\bCC\s*:\s*(\d{5,})\s*-\s*(\d+)\b", texto, re.I)
+    if not m:
+        raise ValueError("Conta do Bradesco não encontrada.")
+    return f"{m.group(1)}-{m.group(2)}"
+
+
+# --------------------------------------------------------------------------
+# BRADESCO — FUNÇÕES AUXILIARES DE POSICIONAMENTO
+# --------------------------------------------------------------------------
+def movimentacao_unicos_bradesco(valores):
+    unicos = []
+    for valor in sorted(valores):
+        if not unicos or valor - unicos[-1] > 1:
+            unicos.append(valor)
+    return unicos
+
+
+def movimentacao_celulas_bradesco(palavras, limites, topo, base):
+    celulas = []
+    for esquerda, direita in zip(limites, limites[1:]):
+        selecionadas = [p for p in palavras
+            if esquerda <= (p["x0"] + p["x1"]) / 2 < direita
+            and topo <= (p["top"] + p["bottom"]) / 2 < base]
+        linhas = movimentacao_agrupar_linhas(selecionadas)
+        celulas.append(" ".join(movimentacao_texto_linha(l) for l in linhas).strip())
+    return celulas
+
+
+# --------------------------------------------------------------------------
+# BRADESCO — LEITURA DAS TABELAS DE MOVIMENTAÇÃO
+# --------------------------------------------------------------------------
+def movimentacao_tabelas_bradesco(pagina):
+    palavras = pagina.extract_words()
+    linhas = movimentacao_agrupar_linhas(palavras)
+    corte = pagina.height
+    for linha in linhas:
+        if re.search(r"Saldos\s+Invest\s+F[aá]cil|SALDO\s+INVEST\s+F[AÁ]CIL",
+                     movimentacao_texto_linha(linha), re.I):
+            corte = min(corte, min(p["top"] for p in linha))
+    cabecalhos = []
+    for linha in linhas:
+        rotulos = {p["text"].casefold().rstrip("."): p for p in linha}
+        if {"data", "lançamento", "dcto", "crédito", "débito", "saldo"} <= rotulos.keys():
+            if min(p["top"] for p in linha) < corte:
+                cabecalhos.append((linha, rotulos))
+    tabelas = []
+    for indice, (cabecalho, rotulos) in enumerate(cabecalhos):
+        inicio = max(p["bottom"] for p in cabecalho)
+        fim = min(corte, min(p["top"] for p in cabecalhos[indice + 1][0])) if indice + 1 < len(cabecalhos) else corte
+        bordas = [e for e in pagina.edges
+            if e["orientation"] == "h" and inicio <= e["top"] <= inicio + 8]
+        if not bordas:
+            raise ValueError(f"Divisória do cabeçalho do Bradesco não encontrada na página {pagina.page_number}.")
+        y = min(e["top"] for e in bordas)
+        xs = movimentacao_unicos_bradesco([
+            e[k] for e in bordas if abs(e["top"] - y) < 0.3 for k in ("x0", "x1")])
+        def borda_esquerda(rotulo):
+            p = rotulos[rotulo]
+            centro = (p["x0"] + p["x1"]) / 2
+            for a, b in zip(xs, xs[1:]):
+                if a <= centro < b:
+                    return a
+            raise ValueError(f"Coluna não reconhecida no Bradesco: {rotulo}.")
+        limites = [borda_esquerda(r) for r in ("data", "lançamento", "dcto", "crédito", "débito", "saldo")] + [xs[-1]]
+        if limites != sorted(set(limites)):
+            raise ValueError("Colunas do Bradesco sobrepostas ou fora de ordem.")
+        totais = [p for p in palavras if p["text"].casefold() == "total"
+            and limites[0] <= p["x0"] < limites[1] and y < p["top"] < fim]
+        total = min(totais, key=lambda p: p["top"]) if totais else None
+        if total:
+            fim = total["top"]
+        else:
+            avisos = [min(p["top"] for p in l) for l in linhas
+                if min(p["top"] for p in l) > y
+                and re.search(r"Os dados acima|Últimos Lançamentos|Folha\s+\d", movimentacao_texto_linha(l), re.I)]
+            if avisos:
+                fim = min(fim, min(avisos))
+        moeda = re.compile(r"-?(?:\d{1,3}(?:\.\d{3})+|\d+),\d{2}")
+        ancoras = sorted([p for p in palavras
+            if limites[5] <= (p["x0"] + p["x1"]) / 2 < limites[6]
+            and y < p["top"] < fim
+            and moeda.fullmatch(p["text"].replace("−", "-"))], key=lambda p:p["top"])
+        centros = [(p["top"] + p["bottom"]) / 2 for p in ancoras]
+        registros = []
+        for i, ancora in enumerate(ancoras):
+            topo = y if i == 0 else (centros[i - 1] + centros[i]) / 2
+            base = fim if i + 1 == len(ancoras) else (centros[i] + centros[i + 1]) / 2
+            celulas = movimentacao_celulas_bradesco(palavras, limites, topo, base)
+            if celulas[-1] != ancora["text"]:
+                raise ValueError(f"Saldo ambíguo no Bradesco: {celulas}.")
+            registros.append(celulas)
+        saldo_total = None
+        if total:
+            total_celulas = movimentacao_celulas_bradesco(palavras, limites, total["top"] - 1, total["bottom"] + 1)
+            saldo_total = movimentacao_numero_br(total_celulas[5])
+        if not registros:
+            raise ValueError("Tabela de movimentação do Bradesco sem registros reconhecidos.")
+        tabelas.append((registros, saldo_total))
+    return tabelas, corte < pagina.height
+
+
+# --------------------------------------------------------------------------
+# BRADESCO — PROCESSAMENTO E CONFERÊNCIA DAS MOVIMENTAÇÕES
+# --------------------------------------------------------------------------
+def movimentacao_processar_extrato_bradesco(caminho_pdf: Path, paginas=None):
+    # Reabre o PDF para acessar as coordenadas das colunas.
+    # Mantém o parâmetro paginas por compatibilidade com o cadastro.
+    saida = []
+    saldo_anterior = None
+    ultima_data = None
+    with pdfplumber.open(caminho_pdf) as pdf:
+        if not pdf.pages:
+            raise ValueError("PDF do Bradesco sem páginas.")
+        texto = re.sub(r"\s+", " ", pdf.pages[0].extract_text() or "")
+        conta = movimentacao_extrair_conta_bradesco(texto)
+        periodo = re.search(r"Entre\s+(\d{2}/\d{2}/\d{4})\s+e\s+(\d{2}/\d{2}/\d{4})", texto, re.I)
+        if not periodo:
+            raise ValueError("Período do Bradesco não encontrado.")
+        inicio, fim = [datetime.strptime(t, "%d/%m/%Y") for t in periodo.groups()]
+        if inicio > fim:
+            raise ValueError("Período inválido no Bradesco.")
+        for pagina in pdf.pages:
+            tabelas, encerrou = movimentacao_tabelas_bradesco(pagina)
+            if not tabelas and not encerrou:
+                raise ValueError(f"Tabela do Bradesco não localizada na página {pagina.page_number}.")
+            for registros, saldo_total in tabelas:
+                for data_txt, descricao, documento, credito, debito, saldo_txt in registros:
+                    saldo = movimentacao_numero_br(saldo_txt.replace("−", "-"))
+                    if data_txt:
+                        ultima_data = datetime.strptime(data_txt, "%d/%m/%Y")
+                    if ultima_data is None:
+                        raise ValueError("Movimentação do Bradesco sem data de referência.")
+                    if re.fullmatch(r"SALDO\s+ANTERIOR", descricao, re.I):
+                        if credito or debito:
+                            raise ValueError("Saldo anterior do Bradesco possui valor de movimentação.")
+                        if saldo_anterior is None:
+                            if ultima_data > inicio:
+                                raise ValueError("Saldo anterior posterior ao início do período do Bradesco.")
+                            saida.append(movimentacao_criar_registro(
+                                caminho_pdf.stem, "Bradesco", conta, ultima_data, "SALDO ANTERIOR", None, saldo))
+                        elif saldo_anterior != saldo:
+                            raise ValueError(f"Continuidade divergente no Bradesco: último saldo = {saldo_anterior}; saldo repetido = {saldo}.")
+                        saldo_anterior = saldo
+                        continue
+                    if saldo_anterior is None:
+                        raise ValueError("Saldo anterior do Bradesco não encontrado antes das movimentações.")
+                    if not inicio <= ultima_data <= fim:
+                        raise ValueError(f"Movimentação fora do período: {ultima_data:%d/%m/%Y}.")
+                    if not descricao or bool(credito) == bool(debito):
+                        raise ValueError(f"Crédito/débito ou descrição ambíguos no Bradesco: {descricao}.")
+                    valor = abs(movimentacao_numero_br(credito)) if credito else -abs(movimentacao_numero_br(debito.replace("−", "-")))
+                    esperado = saldo_anterior + valor
+                    if esperado != saldo:
+                        raise ValueError(f"Saldo divergente no Bradesco em {ultima_data:%d/%m/%Y}: calculado = {esperado}; PDF = {saldo}.")
+                    saida.append(movimentacao_criar_registro(
+                        caminho_pdf.stem, "Bradesco", conta, ultima_data, descricao, valor, saldo))
+                    saldo_anterior = saldo
+                if saldo_total is not None and saldo_total != saldo_anterior:
+                    raise ValueError("Saldo da linha Total diverge do último lançamento do Bradesco.")
+            if encerrou:
+                break
+    if not saida:
+        raise ValueError("Nenhum registro do Bradesco foi extraído.")
+    return saida
+
+
+
+# --------------------------------------------------------------------------
+# CADASTRO DOS PROCESSADORES POR BANCO
+# --------------------------------------------------------------------------
+# Cada banco possui identificação e processamento próprios.
+MOVIMENTACAO_PROCESSADORES = {
+    "Sicredi": (
+        movimentacao_identificar_sicredi,
+        movimentacao_processar_extrato_sicredi,
+    ),
+    "Caixa": (
+        movimentacao_identificar_caixa,
+        movimentacao_processar_extrato_caixa,
+    ),
+    "BB": (
+        movimentacao_identificar_bb,
+        movimentacao_processar_extrato_bb,
+    ),
+    "Itaú": (
+        movimentacao_identificar_itau,
+        movimentacao_processar_extrato_itau,
+    ),
+    
+    "Bradesco": (
+        movimentacao_identificar_bradesco,
+        movimentacao_processar_extrato_bradesco,
+    ),
+}
+
+def movimentacao_processar_arquivo(
+    arquivo: Path,
+):
+    paginas = movimentacao_extrair_paginas(
+        arquivo
+    )
+
+    texto = "\n".join(
+        movimentacao_texto_linha(linha)
+        for pagina in paginas
+        for linha in pagina
+    )
+
+    for banco, (
+        identificar,
+        processar,
+    ) in MOVIMENTACAO_PROCESSADORES.items():
+        if identificar(texto):
+            return processar(
+                arquivo,
+                paginas,
+            )
+
+    raise ValueError(
+        "Banco/modelo não programado. "
+        "Modelos disponíveis: "
+        "Sicredi conta corrente, "
+        "Caixa Extrato por período, "
+        "BB conta corrente e "
+        "Itaú Lançamentos do período."
+    )
+
+# --------------------------------------------------------------------------
+# LOCALIZAÇÃO DOS ARQUIVOS E PROCESSAMENTO EM LOTE
+# --------------------------------------------------------------------------
+def movimentacao_encontrar_arquivos(pasta_raiz: Path):
+    encontradas = [p for p in pasta_raiz.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"]
+    for pasta in pasta_raiz.rglob("*"):
+        if not pasta.is_dir():
+            continue
+        nome = pasta.name.casefold()
+        if nome in ("corrente", "conta corrente", "001. conta corrente") or "sicredi" in nome:
+            encontradas.extend(p for p in pasta.iterdir() if p.is_file() and p.suffix.lower() == ".pdf")
+    return sorted(set(p.resolve() for p in encontradas), key=lambda p: str(p).casefold())
+
+
+def movimentacao_processar_todos_extratos(
+    pasta_raiz: Path,
+    callback=None,
+):
+    arquivos = movimentacao_encontrar_arquivos(
+        pasta_raiz
+    )
+
+    if not arquivos:
+        raise FileNotFoundError(
+            "Nenhum PDF na pasta selecionada "
+            "ou nas subpastas de conta corrente."
+        )
+
+    registros = []
+    erros = []
+    sucesso = 0
+    total = len(arquivos)
+
+    nomes_pastas_corrente = {
+        "corrente",
+        "conta corrente",
+        "001. conta corrente",
+    }
+
+    for indice, arquivo in enumerate(
+        arquivos,
+        start=1,
+    ):
+        # Identifica o banco pela estrutura de pastas,
+        # sem depender da leitura do conteúdo do PDF.
+        pasta_arquivo = arquivo.parent
+
+        if (
+            pasta_arquivo.name.strip().casefold()
+            in nomes_pastas_corrente
+        ):
+            nome_banco = pasta_arquivo.parent.name
+        else:
+            nome_banco = pasta_arquivo.name
+
+        if callback:
+            callback(
+                indice - 1,
+                total,
+                arquivo.name,
+            )
+
+        try:
+            resultado = movimentacao_processar_arquivo(
+                arquivo
+            )
+
+            registros.extend(resultado)
+            sucesso += 1
+
+        except Exception as erro:
+            motivo = (
+                str(erro).strip()
+                or "Falha não identificada durante a leitura."
+            )
+
+            erros.append({
+                "Arquivo": arquivo.stem,
+                "Banco": nome_banco,
+                "Status": "Erro de leitura",
+                "Motivo": motivo,
+            })
+
+        if callback:
+            callback(
+                indice,
+                total,
+                arquivo.name,
+            )
+
+    return registros, erros, sucesso
+
+# --------------------------------------------------------------------------
+# FORMATAÇÃO DAS PLANILHAS
+# --------------------------------------------------------------------------
+def movimentacao_formatar_aba(ws, colunas):
+    borda = Border(**{k: Side(style="thin", color="D9D9D9") for k in ("left", "right", "top", "bottom")})
+    for celula in ws[1]:
+        celula.fill = PatternFill("solid", fgColor=MOVIMENTACAO_COR_CABECALHO)
+        celula.font = Font(bold=True, color="FFFFFF")
+    for linha in ws.iter_rows():
+        for celula in linha:
+            celula.border = borda
+            celula.alignment = Alignment(vertical="center", wrap_text=True)
+    for i, coluna in enumerate(colunas, 1):
+        largura = min(max(len(str(ws.cell(r, i).value or "")) for r in range(1, ws.max_row + 1)) + 3, 90)
+        ws.column_dimensions[get_column_letter(i)].width = max(largura, 14)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+# --------------------------------------------------------------------------
+# EXPORTAÇÃO PARA EXCEL E REGISTRO DE ERROS
+# --------------------------------------------------------------------------
+def movimentacao_salvar_planilha(registros, erros, pasta_saida: Path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Movimentações"
+    ws.append(MOVIMENTACAO_COLUNAS)
+    indices = {coluna: i for i, coluna in enumerate(MOVIMENTACAO_COLUNAS, 1)}
+    for registro in registros:
+        ws.append([
+            float(registro[c]) if isinstance(registro.get(c), Decimal) else registro.get(c)
+            for c in MOVIMENTACAO_COLUNAS
+        ])
+        for celula in ws[ws.max_row]:
+            if isinstance(celula.value, str):
+                celula.data_type = "s"
+        ws.cell(ws.max_row, indices["Conta"]).number_format = "@"
+        ws.cell(ws.max_row, indices["Data"]).number_format = "dd/mm/yyyy"
+        for coluna in ("Valor", "Saldo"):
+            ws.cell(ws.max_row, indices[coluna]).number_format = '#,##0.00;[Red]-#,##0.00'
+        if registro["Descrição"] == "SALDO ANTERIOR":
+            for celula in ws[ws.max_row]:
+                celula.fill = PatternFill("solid", fgColor="E6E7E8")
+                celula.font = Font(bold=True)
+    movimentacao_formatar_aba(ws, MOVIMENTACAO_COLUNAS)
+    we = wb.create_sheet("Erros de leitura")
+    we.append(MOVIMENTACAO_COLUNAS_ERROS)
+    for erro in erros:
+        we.append([erro.get(c, "") for c in MOVIMENTACAO_COLUNAS_ERROS])
+        for celula in we[we.max_row]:
+            if isinstance(celula.value, str):
+                celula.data_type = "s"
+    movimentacao_formatar_aba(we, MOVIMENTACAO_COLUNAS_ERROS)
+    destino = pasta_saida / MOVIMENTACAO_NOME_ARQUIVO
+    wb.save(destino)
+    return destino
+
+# --------------------------------------------------------------------------
+# COMPONENTES DA INTERFACE GRÁFICA
+# --------------------------------------------------------------------------
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+from PIL import Image, ImageOps
+
+# --------------------------------------------------------------------------
+# RECURSOS VISUAIS E ÍCONE
+# --------------------------------------------------------------------------
+def caminho_recurso(nome_arquivo: str) -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / nome_arquivo
+    return Path(__file__).resolve().parent / nome_arquivo
+
+
+def aplicar_icone_janela(janela: ctk.CTk) -> None:
+    caminho_icone = caminho_recurso("icone.ico")
+    if caminho_icone.exists():
+        try:
+            janela.iconbitmap(default=str(caminho_icone))
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# INTERFACE GRÁFICA
+# --------------------------------------------------------------------------
+class LeitorMovimentacoesApp:
+    STONE = "#636467"
+    CANVAS = "#E6E7E8"
+    WARM = "#BBBCAF"
+    LAND = "#934A37"
+    LAND_HOVER = "#7D3E30"
+    FUNDO_ESCURO = "#303133"
+    CARD_ESCURO = "#414245"
+    VERDE = "#3F7659"
+    VERMELHO = "#A33F35"
+
+    def __init__(self, raiz: ctk.CTk):
+        self.raiz = raiz
+        self.modo_escuro = True
+        self.logo = self.carregar_logo()
+        self.caminho_pasta = ctk.StringVar()
+        self.status = ctk.StringVar(value="Selecione a pasta raiz dos extratos para iniciar.")
+        self.percentual = ctk.StringVar(value="0%")
+        self.resultado = ctk.StringVar(value="")
+        self.arquivo_saida: Path | None = None
+        self.tipo_processamento = ""
+        self.processamento_ativo = False
+        self.eventos = queue.Queue()
+        self.raiz.after(100, self.consumir_eventos)
+        self.raiz.title("Leitor de Movimentações")
+        aplicar_icone_janela(self.raiz)
+        self.raiz.geometry("790x590")
+        self.raiz.minsize(700, 520)
+        self.raiz.resizable(True, True)
+        self.raiz.protocol("WM_DELETE_WINDOW", self.fechar_aplicacao)
+        self.criar_interface()
+
+    def carregar_logo(self):
+        for nome in ["logo_icona.png", "LOGO_ICONA_PB_INVERSA.png", "LOGO_ICONA_PB_INVERSA.jpg", "LOGO_ICONA_PB_INVERSA-2.jpg"]:
+            caminho = caminho_recurso(nome)
+            if caminho.exists():
+                try:
+                    imagem = Image.open(caminho).convert("RGBA")
+                    imagem = ImageOps.contain(imagem, (115, 62), method=Image.Resampling.LANCZOS)
+                    return ctk.CTkImage(light_image=imagem, dark_image=imagem, size=imagem.size)
+                except Exception:
+                    pass
+        return None
+
+    def criar_interface(self):
+        quadro = ctk.CTkFrame(self.raiz, corner_radius=0, fg_color=(self.CANVAS, self.FUNDO_ESCURO))
+        quadro.pack(fill="both", expand=True)
+        quadro.grid_columnconfigure(0, weight=1)
+        quadro.grid_rowconfigure(1, weight=1)
+
+        cabecalho = ctk.CTkFrame(quadro, fg_color=self.LAND, corner_radius=0, height=90)
+        cabecalho.grid(row=0, column=0, sticky="ew")
+        cabecalho.grid_propagate(False)
+        cabecalho.grid_columnconfigure(1, weight=1)
+        if self.logo:
+            ctk.CTkLabel(cabecalho, text="", image=self.logo).grid(row=0, column=0, padx=(22, 13), pady=10)
+        else:
+            ctk.CTkLabel(cabecalho, text="Leitor de Movimentações", text_color="white", font=ctk.CTkFont(size=19, weight="bold")).grid(row=0, column=0, padx=(22, 13), pady=14)
+
+        textos = ctk.CTkFrame(cabecalho, fg_color="transparent")
+        textos.grid(row=0, column=1, sticky="w", pady=12)
+        ctk.CTkLabel(textos, text="Movimentações bancárias", text_color="white", font=ctk.CTkFont(size=18, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(textos, text="Leitura das movimentações de conta corrente • Sicredi", text_color="#F3E4DE", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(2, 0))
+
+        area = ctk.CTkFrame(quadro, fg_color="transparent")
+        area.grid(row=1, column=0, sticky="nsew", padx=22, pady=(18, 8))
+        area.grid_columnconfigure(0, weight=1)
+
+        card = ctk.CTkFrame(area, corner_radius=12, fg_color=("#FFFFFF", self.CARD_ESCURO), border_width=1, border_color=(self.WARM, self.STONE))
+        card.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(card, text="Pasta dos extratos", text_color=(self.STONE, "#F5F5F5"), font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w", padx=18, pady=(16, 3))
+        ctk.CTkLabel(card, text="Pasta com PDFs ou raiz com subpastas dos bancos e de conta corrente.", text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 14))
+
+        linha = ctk.CTkFrame(card, fg_color="transparent")
+        linha.grid(row=2, column=0, sticky="ew", padx=18)
+        linha.grid_columnconfigure(0, weight=1)
+        ctk.CTkEntry(linha, textvariable=self.caminho_pasta, height=34, corner_radius=7, border_color=(self.WARM, self.STONE), fg_color=("#FFFFFF", "#252627"), text_color=(self.STONE, "#F5F5F5")).grid(row=0, column=0, sticky="ew")
+        self.botao_selecionar = ctk.CTkButton(linha, text="Selecionar", command=self.selecionar_pasta, width=104, height=34, corner_radius=7, fg_color=(self.CANVAS, self.STONE), hover_color=(self.WARM, "#4F5053"), text_color=(self.STONE, "#F5F5F5"))
+        self.botao_selecionar.grid(row=0, column=1, padx=(9, 0))
+
+        ctk.CTkLabel(card, text="Escolha o processamento", text_color=(self.STONE, "#F5F5F5"), font=ctk.CTkFont(size=13, weight="bold")).grid(row=3, column=0, sticky="w", padx=18, pady=(18, 8))
+        botoes = ctk.CTkFrame(card, fg_color="transparent")
+        botoes.grid(row=4, column=0, sticky="w", padx=18, pady=(0, 17))
+        self.botao_correntes = ctk.CTkButton(botoes, text="Processar Movimentações", command=lambda: self.iniciar("movimentacoes"), width=230, height=39, corner_radius=8, fg_color=self.LAND, hover_color=self.LAND_HOVER, font=ctk.CTkFont(size=13, weight="bold"))
+        self.botao_correntes.grid(row=0, column=0, padx=(0, 10))
+        ctk.CTkLabel(area, textvariable=self.status, text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=12)).grid(row=1, column=0, sticky="w", pady=(10, 3))
+        self.progresso = ctk.CTkProgressBar(area, height=11, corner_radius=6, progress_color=self.LAND, fg_color=(self.WARM, self.STONE))
+        self.progresso.grid(row=2, column=0, sticky="ew")
+        self.progresso.set(0)
+        ctk.CTkLabel(area, textvariable=self.percentual, text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=11)).grid(row=3, column=0, sticky="e", pady=(2, 0))
+        self.label_resultado = ctk.CTkLabel(area, textvariable=self.resultado, justify="left", anchor="w", wraplength=730, text_color=(self.VERDE, "#7FC49B"), font=ctk.CTkFont(size=12))
+        self.label_resultado.grid(row=4, column=0, sticky="w", pady=(8, 3))
+        self.botao_abrir = ctk.CTkButton(area, text="Abrir planilha", command=self.abrir_planilha, state="disabled", width=135, height=32, corner_radius=8, fg_color=(self.CANVAS, self.STONE), hover_color=(self.WARM, "#4F5053"), text_color=(self.STONE, "#F5F5F5"))
+        self.botao_abrir.grid(row=5, column=0, sticky="w", pady=(2, 0))
+
+        rodape = ctk.CTkFrame(quadro, fg_color="transparent")
+        rodape.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 13))
+        rodape.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(rodape, text="ÍCONA Contabilidade • Uso licenciado • Distribuição proibida", text_color=(self.STONE, self.WARM), font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.botao_tema = ctk.CTkButton(rodape, text="☀ Claro", command=self.alternar_tema, width=98, height=28, corner_radius=14, fg_color=(self.CANVAS, self.STONE), hover_color=(self.WARM, "#4F5053"), text_color=(self.STONE, "#F5F5F5"), font=ctk.CTkFont(size=11, weight="bold"))
+        self.botao_tema.grid(row=0, column=1, sticky="e")
+
+    # --------------------------------------------------------------------------
+    # SELEÇÃO DA PASTA E TEMA
+    # --------------------------------------------------------------------------
+    def selecionar_pasta(self):
+        pasta = filedialog.askdirectory(title="Selecione a pasta raiz dos extratos", initialdir=self.caminho_pasta.get() or str(Path.home()))
+        if pasta:
+            self.caminho_pasta.set(pasta)
+            self.limpar_resultado()
+
+    def alternar_tema(self):
+        self.modo_escuro = not self.modo_escuro
+        ctk.set_appearance_mode("Dark" if self.modo_escuro else "Light")
+        self.botao_tema.configure(text="☀ Claro" if self.modo_escuro else "☾ Escuro")
+
+    def limpar_resultado(self):
+        self.arquivo_saida = None
+        self.tipo_processamento = ""
+        self.status.set("Selecione a pasta raiz dos extratos para iniciar.")
+        self.percentual.set("0%")
+        self.progresso.set(0)
+        self.resultado.set("")
+        self.botao_abrir.configure(state="disabled")
+
+    # --------------------------------------------------------------------------
+    # CONTROLE DO PROCESSAMENTO
+    # --------------------------------------------------------------------------
+    def iniciar(self, tipo: str):
+        if self.processamento_ativo:
+            return
+        if not self.caminho_pasta.get().strip():
+            messagebox.showerror("Pasta inválida", "Selecione uma pasta válida.")
+            return
+        pasta = Path(self.caminho_pasta.get().strip().strip('"')).expanduser()
+        if not pasta.is_dir():
+            messagebox.showerror("Pasta inválida", "Selecione uma pasta válida.")
+            return
+        self.tipo_processamento = tipo
+        self.processamento_ativo = True
+        for botao in [self.botao_correntes, self.botao_selecionar, self.botao_abrir]:
+            botao.configure(state="disabled")
+        self.progresso.set(0)
+        self.percentual.set("0%")
+        descricao = "movimentações"
+        self.status.set(f"Localizando PDFs de {descricao}...")
+        self.arquivo_saida = None
+        self.resultado.set("")
+        self.label_resultado.configure(text_color=(self.VERDE, "#7FC49B"))
+        threading.Thread(target=self.executar, args=(pasta, tipo), daemon=True).start()
+
+    # --------------------------------------------------------------------------
+    # PROCESSAMENTO EM SEGUNDO PLANO E EVENTOS
+    # --------------------------------------------------------------------------
+    def consumir_eventos(self):
+        try:
+            while True:
+                tipo, dados = self.eventos.get_nowait()
+                if tipo == "progresso":
+                    self.atualizar(*dados)
+                elif tipo == "sucesso":
+                    self.arquivo_saida, quantidade, erros, arquivos = dados
+                    self.sucesso(quantidade, erros, arquivos)
+                elif tipo == "erro":
+                    self.erro(dados)
+        except queue.Empty:
+            pass
+        self.raiz.after(100, self.consumir_eventos)
+
+    def executar(self, pasta: Path, tipo: str):
+        try:
+            registros, erros, arquivos = movimentacao_processar_todos_extratos(
+                pasta, lambda a, t, n: self.eventos.put(("progresso", (a, t, n))))
+            destino = movimentacao_salvar_planilha(registros, erros, pasta)
+            self.eventos.put(("sucesso", (destino, len(registros), erros, arquivos)))
+        except Exception as erro:
+            self.eventos.put(("erro", str(erro)))
+
+    # --------------------------------------------------------------------------
+    # PROGRESSO E RESULTADO
+    # --------------------------------------------------------------------------
+    def atualizar(self, atual, total, nome):
+        percentual = int(atual / total * 100) if total else 0
+        self.progresso.set(atual / total if total else 0)
+        self.percentual.set(f"{percentual}%")
+        self.status.set(f"Processando {atual} de {total}: {nome}")
+
+    def sucesso(self, total, erros, arquivos):
+        self.processamento_ativo = False
+        self.progresso.set(1)
+        self.percentual.set("100%")
+        self.status.set("Processamento concluído.")
+        aviso = f"\n{len(erros)} arquivo(s) apresentaram erro. Consulte a aba 'Erros de leitura'." if erros else ""
+        mensagem = f"Concluído: {arquivos} PDF(s) importado(s); {total} linha(s), incluindo saldos anteriores.{aviso}\nPlanilha criada: {self.arquivo_saida}"
+        self.resultado.set(mensagem)
+        self.botao_correntes.configure(state="normal")
+        self.botao_selecionar.configure(state="normal")
+        self.botao_abrir.configure(state="normal")
+        messagebox.showinfo("Processamento concluído", mensagem)
+
+    def erro(self, mensagem):
+        self.processamento_ativo = False
+        self.status.set("Processamento não concluído.")
+        self.resultado.set(f"Erro: {mensagem}")
+        self.label_resultado.configure(text_color=(self.VERMELHO, "#E58C82"))
+        self.botao_correntes.configure(state="normal")
+        self.botao_selecionar.configure(state="normal")
+        self.botao_abrir.configure(state="disabled")
+        messagebox.showerror("Erro no processamento", mensagem)
+
+    # --------------------------------------------------------------------------
+    # ABERTURA DA PLANILHA E FECHAMENTO
+    # --------------------------------------------------------------------------
+    def abrir_planilha(self):
+        if not self.arquivo_saida or not self.arquivo_saida.exists():
+            messagebox.showwarning("Planilha não encontrada", "A planilha de resultado não está disponível.")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(self.arquivo_saida)
+            else:
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(self.arquivo_saida)])
+        except OSError as erro:
+            messagebox.showerror("Não foi possível abrir", str(erro))
+
+    def fechar_aplicacao(self):
+        if self.processamento_ativo:
+            messagebox.showwarning("Processamento em andamento", "Aguarde o processamento terminar antes de fechar o programa.")
+            return
+        self.raiz.destroy()
+
+
+# --------------------------------------------------------------------------
+# INICIALIZAÇÃO DO APLICATIVO
+# --------------------------------------------------------------------------
+def main():
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("br.com.leitor.extratos.movimentacoes")
+        except Exception:
+            pass
+    ctk.set_appearance_mode("Dark")
+    ctk.set_default_color_theme("blue")
+    raiz = ctk.CTk()
+    LeitorMovimentacoesApp(raiz)
+    raiz.mainloop()
+
+
+if __name__ == "__main__":
+    main()
